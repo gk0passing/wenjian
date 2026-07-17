@@ -1,0 +1,806 @@
+那你可以直接按官方 8 卡 verl 路线跑，不需要再做单卡缩减。官方 FinQA 训练脚本本身就是按 8 GPU + Qwen3-4B + GRPO + LoRA 配置的。
+
+下面给你一套“一天内先跑通，再开正式实验”的流程。
+
+1. 创建环境
+
+推荐 Ubuntu 22.04、Python 3.11。
+
+git clone https://github.com/rllm-org/rllm.git
+cd rllm
+
+curl -LsSf https://astral.sh/uv/install.sh | sh
+source ~/.bashrc
+
+uv python install 3.11
+uv venv --python 3.11
+source .venv/bin/activate
+
+确认 8 张卡：
+
+nvidia-smi -L
+
+应该看到 GPU 0 到 GPU 7。
+
+设置卡：
+
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+
+安装 verl 后端：
+
+uv pip install -e ".[verl]" --torch-backend=cu128
+uv pip install --no-deps -e cookbooks/finqa
+
+安装 Megatron 相关依赖：
+
+bash scripts/install_megatron.sh cu128
+
+如果你的驱动或 CUDA 环境不是 CUDA 12.8，先运行：
+
+nvidia-smi
+
+根据驱动兼容性选择对应的 cu12x 版本，不要混装多个 CUDA 版 PyTorch。
+
+验证：
+
+python - <<'PY'
+import torch
+
+print("torch:", torch.__version__)
+print("cuda:", torch.version.cuda)
+print("gpu count:", torch.cuda.device_count())
+
+for i in range(torch.cuda.device_count()):
+    print(i, torch.cuda.get_device_name(i),
+          round(torch.cuda.get_device_properties(i).total_memory / 1024**3, 1), "GB")
+PY
+2. 准备数据
+python cookbooks/finqa/prepare_finqa_data.py
+pytest cookbooks/finqa/test.py -v
+
+FinQA 脚本会下载并注册：
+
+4,030 条训练集
+522 条验证集
+558 条测试集
+207 家公司
+6,923 张财务表
+
+检查数据：
+
+python - <<'PY'
+from rllm.data.dataset import DatasetRegistry
+
+for split in ["train", "val", "test"]:
+    ds = DatasetRegistry.load_dataset("finqa", split)
+    print(split, len(ds))
+PY
+3. 配置 Judge API
+
+默认 FinQA reward 使用 OpenAI Judge：
+
+export OPENAI_API_KEY="你的 OpenAI API Key"
+
+单表问题默认使用 gpt-5-nano，多表问题使用 gpt-5-mini。缺少 Key 时程序不会一定报错，但正确性 reward 会回退成 0。
+
+检查：
+
+python - <<'PY'
+import os
+print("OPENAI_API_KEY:", "OK" if os.getenv("OPENAI_API_KEY") else "MISSING")
+PY
+4. 先跑 1 个 batch 的 8 卡 smoke test
+
+不要第一步就全量训练。先确认以下链路全部工作：
+
+数据 → Agent rollout → 工具调用 → reward → advantage → loss → optimizer step
+
+执行：
+
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export PYTHONUNBUFFERED=1
+export TOKENIZERS_PARALLELISM=false
+
+bash cookbooks/finqa/train_verl.sh \
+  trainer.total_epochs=1 \
+  +trainer.total_training_steps=1 \
+  trainer.val_before_train=false \
+  trainer.test_freq=-1 \
+  trainer.save_freq=1 \
+  trainer.logger="['console']" \
+  trainer.project_name=finqa-smoke \
+  trainer.experiment_name=a800-8gpu-smoke \
+  data.train_batch_size=8 \
+  data.val_batch_size=8 \
+  data.max_prompt_length=4096 \
+  data.max_response_length=1024 \
+  actor_rollout_ref.rollout.n=2 \
+  actor_rollout_ref.rollout.max_model_len=6144 \
+  actor_rollout_ref.actor.ppo_mini_batch_size=8 \
+  actor_rollout_ref.actor.ppo_max_token_len_per_gpu=8192 \
+  actor_rollout_ref.rollout.gpu_memory_utilization=0.65
+
+但这里有一个配置兼容问题：不同版本的 verl 对“只跑一步”的字段名可能是：
+
+trainer.total_training_steps
+
+或者项目统一配置中的：
+
+rllm.trainer.total_batches
+
+当前 rLLM 通用配置明确支持 rllm.trainer.total_batches。
+
+因此更稳妥的版本是：
+
+bash cookbooks/finqa/train_verl.sh \
+  rllm.trainer.total_batches=1 \
+  trainer.total_epochs=1 \
+  trainer.val_before_train=false \
+  trainer.test_freq=-1 \
+  trainer.save_freq=1 \
+  trainer.logger="['console']" \
+  trainer.project_name=finqa-smoke \
+  trainer.experiment_name=a800-8gpu-smoke \
+  data.train_batch_size=8 \
+  data.val_batch_size=8 \
+  data.max_prompt_length=4096 \
+  data.max_response_length=1024 \
+  actor_rollout_ref.rollout.n=2 \
+  actor_rollout_ref.rollout.max_model_len=6144 \
+  actor_rollout_ref.actor.ppo_mini_batch_size=8 \
+  actor_rollout_ref.actor.ppo_max_token_len_per_gpu=8192 \
+  actor_rollout_ref.rollout.gpu_memory_utilization=0.65
+
+如果 Hydra 报：
+
+Key 'total_batches' is not in struct
+
+则写成：
+
++rllm.trainer.total_batches=1
+5. 官方原始训练配置
+
+Smoke test 成功后，可以直接跑官方脚本：
+
+bash cookbooks/finqa/train_verl.sh
+
+官方配置是：
+
+模型：Qwen/Qwen3-4B-Instruct-2507
+算法：GRPO
+GPU：8
+LoRA rank：32
+train batch：16
+rollout n：4
+prompt：8192
+response：4096
+最大模型长度：16384
+FSDP parameter offload：开启
+FSDP optimizer offload：开启
+
+不过为了第一天稳定，我建议不要直接用 16K 上下文。先运行这个中等版本：
+
+bash cookbooks/finqa/train_verl.sh \
+  data.train_batch_size=16 \
+  data.val_batch_size=32 \
+  data.max_prompt_length=4096 \
+  data.max_response_length=1024 \
+  actor_rollout_ref.rollout.max_model_len=6144 \
+  actor_rollout_ref.rollout.n=4 \
+  actor_rollout_ref.rollout.gpu_memory_utilization=0.70 \
+  actor_rollout_ref.actor.ppo_mini_batch_size=32 \
+  actor_rollout_ref.actor.ppo_max_token_len_per_gpu=8192 \
+  trainer.val_before_train=false \
+  trainer.test_freq=10 \
+  trainer.save_freq=10 \
+  rllm.trainer.total_batches=20 \
+  trainer.project_name=finqa-day1 \
+  trainer.experiment_name=qwen3-4b-grpo-a800
+
+如果 total_batches 需要 +：
+
++rllm.trainer.total_batches=20
+6. A800 80GB 可以进一步加速
+
+如果你的 A800 是 80GB，可以减少 CPU offload，通常速度会明显更快。
+
+官方默认：
+
+actor_rollout_ref.actor.fsdp_config.param_offload=true
+actor_rollout_ref.actor.fsdp_config.optimizer_offload=true
+
+可以尝试关闭：
+
+actor_rollout_ref.actor.fsdp_config.param_offload=false \
+actor_rollout_ref.actor.fsdp_config.optimizer_offload=false
+
+完整命令：
+
+bash cookbooks/finqa/train_verl.sh \
+  actor_rollout_ref.actor.fsdp_config.param_offload=false \
+  actor_rollout_ref.actor.fsdp_config.optimizer_offload=false \
+  actor_rollout_ref.rollout.gpu_memory_utilization=0.75 \
+  data.max_prompt_length=4096 \
+  data.max_response_length=1024 \
+  actor_rollout_ref.rollout.max_model_len=6144 \
+  trainer.val_before_train=false \
+  rllm.trainer.total_batches=20
+
+如果是 A800 40GB，则建议继续保留 offload。
+
+7. 开启 trajectory 日志
+
+为了后续做项目展示，建议保存 Agent 的完整轨迹：
+
+bash cookbooks/finqa/train_verl.sh \
+  rllm.episode_logging.log_episodes=true \
+  rllm.episode_logging.episode_log_dir=logs/finqa-a800 \
+  trainer.logger="['console']" \
+  rllm.trainer.total_batches=20
+
+配置中原生支持 episode 日志目录。
+
+训练后检查：
+
+find logs/finqa-a800 -type f | head -20
+
+查看工具调用：
+
+grep -R '"accessed_tables"' logs/finqa-a800 | head
+grep -R '"turns"' logs/finqa-a800 | head
+grep -R '"reward"' logs/finqa-a800 | head
+8. 如何判断真正跑通 RL
+
+日志至少应该出现：
+
+rollout
+tool_calls
+get_table_names
+get_table_info
+sql_query
+calculator
+reward
+advantage
+actor loss
+optimizer step
+checkpoint
+
+只看到 FINAL ANSWER 和 reward，说明只是完成了推理评测。
+
+看到以下内容，才代表真正更新了模型：
+
+policy loss / actor loss
+grad norm
+optimizer step
+global step
+checkpoint saved
+9. 推荐的一天安排
+上午
+安装环境
+准备数据
+pytest
+跑 1 batch smoke test
+下午
+跑 20 batch
+开启 trajectory logging
+检查 reward 和 loss
+保存 checkpoint
+晚上
+
+从日志中挑：
+
+一条成功轨迹
+一条选错表轨迹
+一条 SQL 写错轨迹
+一条 reward 较高轨迹
+
+然后整理第一版实验表：
+
+指标	Base
+平均 reward	实测
+正确答案率	实测
+正确表访问率	实测
+平均轮数	实测
+SQL 失败率	实测
+最建议你现在先执行的命令
+bash cookbooks/finqa/train_verl.sh \
+  data.train_batch_size=8 \
+  data.val_batch_size=8 \
+  data.max_prompt_length=4096 \
+  data.max_response_length=1024 \
+  actor_rollout_ref.rollout.n=2 \
+  actor_rollout_ref.rollout.max_model_len=6144 \
+  actor_rollout_ref.actor.ppo_mini_batch_size=8 \
+  actor_rollout_ref.rollout.gpu_memory_utilization=0.65 \
+  trainer.val_before_train=false \
+  trainer.test_freq=-1 \
+  trainer.save_freq=1 \
+  +rllm.trainer.total_batches=1 \
+  trainer.logger="['console']" \
+  trainer.project_name=finqa-smoke \
+  trainer.experiment_name=a800-8gpu-smoke
+
+这条成功以后，再把 total_batches 从 1 改成 20，把 rollout.n 从 2 改成 4。
+
+还需要做啥改进吗，我现在需要成deepseek的api，
+思考了 18s
+
+需要改，而且最合理的架构不是把本地训练模型换成 DeepSeek API，而是：
+
+本地 Qwen3-4B：作为可训练的 Agent policy，继续用 GRPO + LoRA 更新。
+DeepSeek API：作为 Judge/Reward Model，替换当前的 OpenAI Judge。
+程序化数值校验：作为主要 reward，减少 API Judge 的噪声和费用。
+
+DeepSeek API 无法让你更新 DeepSeek 本身的参数，所以不能直接替代本地 policy 完成这次 RL 训练；它适合当 evaluator、teacher 或数据生成器。
+
+一、先把 OpenAI Judge 改成 DeepSeek
+
+当前 finqa_eval.py 使用的是：
+
+openai.OpenAI(api_key=OPENAI_API_KEY)
+
+然后调用 OpenAI Responses API：
+
+_JUDGE_CLIENT.responses.create(...)
+
+DeepSeek 提供 OpenAI 兼容接口，但应使用：
+
+client.chat.completions.create(...)
+
+Base URL 是 https://api.deepseek.com。截至 2026 年 7 月 17 日，建议直接使用 deepseek-v4-flash 和 deepseek-v4-pro；旧的 deepseek-chat、deepseek-reasoner 将于 2026 年 7 月 24 日停止使用。
+
+配置环境变量
+export DEEPSEEK_API_KEY="你的 DeepSeek API Key"
+export DEEPSEEK_BASE_URL="https://api.deepseek.com"
+
+export DEEPSEEK_JUDGE_MODEL="deepseek-v4-flash"
+export DEEPSEEK_MULTI_TABLE_JUDGE_MODEL="deepseek-v4-pro"
+
+其中：
+
+单表问题用 v4-flash：速度更快、成本更低。
+多表复杂问题用 v4-pro：判断推理完整性更稳。
+
+官方当前价格中，Flash 和 Pro 的未缓存输入分别是每百万 token 1 元和 3 元，输出分别是 2 元和 6 元。
+
+二、修改 cookbooks/finqa/finqa_eval.py
+1. 替换配置部分
+
+把原来的：
+
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+JUDGE_MODEL = "gpt-5-nano"
+MULTI_TABLE_JUDGE_MODEL = "gpt-5-mini"
+
+改成：
+
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
+DEEPSEEK_BASE_URL = os.environ.get(
+    "DEEPSEEK_BASE_URL",
+    "https://api.deepseek.com",
+)
+
+JUDGE_MODEL = os.environ.get(
+    "DEEPSEEK_JUDGE_MODEL",
+    "deepseek-v4-flash",
+)
+
+MULTI_TABLE_JUDGE_MODEL = os.environ.get(
+    "DEEPSEEK_MULTI_TABLE_JUDGE_MODEL",
+    "deepseek-v4-pro",
+)
+2. 替换 client 初始化
+
+把 _make_judge_client() 改成：
+
+def _make_judge_client():
+    """Build a DeepSeek OpenAI-compatible client."""
+    if not DEEPSEEK_API_KEY:
+        return None
+
+    try:
+        return openai.OpenAI(
+            api_key=DEEPSEEK_API_KEY,
+            base_url=DEEPSEEK_BASE_URL,
+            timeout=90.0,
+            max_retries=3,
+        )
+    except Exception:
+        return None
+3. 替换 _call_judge
+
+建议单表和多表都使用 JSON Output，避免解析 "true"、"false" 时误判。
+
+def _call_judge(
+    system_prompt: str,
+    user_prompt: str,
+    *,
+    multi_table: bool,
+) -> tuple[bool | float, dict]:
+    """Score an answer with DeepSeek's OpenAI-compatible Chat API."""
+
+    if _JUDGE_CLIENT is None:
+        return (0.0 if multi_table else False), {
+            "error": "DEEPSEEK_API_KEY is missing"
+        }
+
+    if multi_table:
+        output_instruction = """
+Return JSON only, using exactly this structure:
+
+{
+  "primary_data_score": 0,
+  "derived_metrics_score": 0,
+  "reasoning_score": 0,
+  "consistency_score": 0,
+  "completeness_score": 0,
+  "structure_score": 0,
+  "explanation": "brief explanation"
+}
+
+Every score must be a number from 0 to 100.
+Do not output Markdown or any text outside the JSON object.
+"""
+        model = MULTI_TABLE_JUDGE_MODEL
+        max_tokens = 1200
+    else:
+        output_instruction = """
+Return JSON only, using exactly this structure:
+
+{
+  "correct": true,
+  "explanation": "brief explanation"
+}
+
+Set correct to true only when the model answer matches the label.
+Do not output Markdown or any text outside the JSON object.
+"""
+        model = JUDGE_MODEL
+        max_tokens = 400
+
+    messages = [
+        {
+            "role": "system",
+            "content": system_prompt + "\n\n" + output_instruction,
+        },
+        {
+            "role": "user",
+            "content": user_prompt,
+        },
+    ]
+
+    try:
+        response = _JUDGE_CLIENT.chat.completions.create(
+            model=model,
+            messages=messages,
+            max_tokens=max_tokens,
+            response_format={"type": "json_object"},
+            extra_body={
+                "thinking": {
+                    "type": "disabled",
+                }
+            },
+        )
+
+        content = response.choices[0].message.content or ""
+        parsed = json.loads(content)
+
+        if multi_table:
+            weighted = 0.0
+            total_weight = 0.0
+
+            for key, weight in CORRECTNESS_WEIGHTS.items():
+                value = parsed.get(key)
+
+                if isinstance(value, int | float):
+                    normalized = max(
+                        0.0,
+                        min(100.0, float(value)),
+                    ) / 100.0
+
+                    weighted += normalized * weight
+                    total_weight += weight
+
+            score = (
+                weighted / total_weight
+                if total_weight > 0
+                else 0.0
+            )
+
+            return max(0.0, min(1.0, score)), parsed
+
+        correct = parsed.get("correct", False)
+
+        if isinstance(correct, str):
+            correct = correct.strip().lower() == "true"
+
+        return bool(correct), parsed
+
+    except Exception as exc:
+        return (0.0 if multi_table else False), {
+            "error": type(exc).__name__,
+            "message": str(exc),
+        }
+
+DeepSeek 的 JSON Output 需要设置：
+
+response_format={"type": "json_object"}
+
+同时提示词中必须明确要求输出 JSON，否则可能出现空白输出或请求看似卡住的情况。
+
+代码里显式关闭了思考模式：
+
+extra_body={"thinking": {"type": "disabled"}}
+
+因为 DeepSeek V4 当前默认开启思考模式；对这种简单裁判任务，关闭思考通常可以减少延迟与 token 消耗。
+
+三、先单独测试 DeepSeek API
+
+不要直接启动 8 卡训练。先做一个接口测试：
+
+python - <<'PY'
+import json
+import os
+from openai import OpenAI
+
+client = OpenAI(
+    api_key=os.environ["DEEPSEEK_API_KEY"],
+    base_url="https://api.deepseek.com",
+)
+
+response = client.chat.completions.create(
+    model="deepseek-v4-flash",
+    messages=[
+        {
+            "role": "system",
+            "content": (
+                'Output JSON only using: '
+                '{"correct": true, "explanation": "brief reason"}'
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                "Reference answer: 12.5%\n"
+                "Candidate answer: 12.5%\n"
+                "Are they equivalent?"
+            ),
+        },
+    ],
+    response_format={"type": "json_object"},
+    max_tokens=200,
+    extra_body={"thinking": {"type": "disabled"}},
+)
+
+content = response.choices[0].message.content
+print(content)
+print(json.loads(content))
+PY
+
+正常输出应类似：
+
+{
+  "correct": true,
+  "explanation": "The candidate answer exactly matches the reference."
+}
+四、运行 FinQA 单元测试
+pytest cookbooks/finqa/test.py -v
+
+然后单独调用 evaluator：
+
+python - <<'PY'
+from finqa_eval import _call_judge
+
+decision, metadata = _call_judge(
+    system_prompt="Judge whether the answer matches the reference.",
+    user_prompt=(
+        "question: What was the growth rate?\n"
+        "model response: FINAL ANSWER: 12.5%\n"
+        "label: 12.5%"
+    ),
+    multi_table=False,
+)
+
+print("decision:", decision)
+print("metadata:", metadata)
+PY
+
+需要在 cookbooks/finqa 目录执行，或者确保它已通过 editable 模式安装。
+
+五、最值得做的项目改进
+
+只把 GPT Judge 换成 DeepSeek，还不算很强的项目创新。建议至少完成下面两个。
+
+改进 1：混合 reward
+
+当前 evaluator 的最终 reward 只有：
+
+reward=correctness
+
+虽然计算了 table_access，但并没有真正加到总 reward 中。
+
+改为：
+
+final_reward = (
+    0.70 * correctness
+    + 0.15 * numeric_match
+    + 0.15 * table_bonus
+)
+
+推荐结构：
+
+EvalOutput(
+    reward=final_reward,
+    is_correct=is_correct,
+    signals=[
+        Signal(name="judge_correctness", value=correctness),
+        Signal(name="numeric_match", value=numeric_match),
+        Signal(name="table_access", value=table_bonus),
+    ],
+    metadata=metadata,
+)
+
+这样就算 DeepSeek Judge 有少量波动，Agent 仍可从程序化信号和正确表访问中获得学习信号。
+
+改进 2：先程序校验，再调用 DeepSeek
+
+很多 FinQA 答案本质上是数字，例如：
+
+12.5%
+0.125
+$4.2 million
+4200000
+
+可以先做数值归一化：
+
+def normalize_number(text: str) -> float | None:
+    text = text.lower().replace(",", "").strip()
+
+    multiplier = 1.0
+    if "million" in text:
+        multiplier = 1_000_000
+    elif "billion" in text:
+        multiplier = 1_000_000_000
+
+    percentage = "%" in text
+
+    match = re.search(r"-?\d+(?:\.\d+)?", text)
+    if not match:
+        return None
+
+    value = float(match.group()) * multiplier
+
+    if percentage:
+        value /= 100.0
+
+    return value
+
+再判断：
+
+def numeric_equivalent(
+    prediction: str,
+    ground_truth: str,
+    rel_tol: float = 1e-3,
+    abs_tol: float = 1e-6,
+) -> bool:
+    pred = normalize_number(prediction)
+    gold = normalize_number(ground_truth)
+
+    if pred is None or gold is None:
+        return False
+
+    return abs(pred - gold) <= max(
+        abs_tol,
+        rel_tol * max(abs(pred), abs(gold), 1.0),
+    )
+
+调用顺序：
+
+if numeric_equivalent(final_answer, ground_truth):
+    correctness = 1.0
+    is_correct = True
+    judge_source = "programmatic"
+else:
+    verdict, rubric = _call_judge(...)
+    correctness = float(verdict)
+    is_correct = bool(verdict)
+    judge_source = "deepseek"
+
+这样有三个优点：
+
+大幅减少 DeepSeek API 请求。
+数字题 reward 更确定。
+能向面试官解释如何减少 LLM-as-Judge 偏差。
+六、增加缓存，否则训练会重复花钱
+
+GRPO 每个问题会生成多条 trajectory，相似答案可能反复调用 Judge。
+
+可以基于以下内容做哈希缓存：
+
+cache_key = sha256(
+    json.dumps(
+        {
+            "question": question,
+            "answer": final_answer,
+            "ground_truth": ground_truth,
+            "multi_table": multi_table,
+        },
+        sort_keys=True,
+        ensure_ascii=False,
+    ).encode()
+).hexdigest()
+
+缓存到 SQLite：
+
+judge_cache.sqlite
+
+命中时直接读取 reward，不再调用 API。
+
+DeepSeek 官方也会自动进行上下文缓存，不要求额外修改 API 调用，但你自己的“完整裁判结果缓存”仍能避免重复生成输出。
+
+七、调用失败时不要返回 0 分
+
+当前代码发生 API 错误就返回 0，这会把网络波动误当成错误答案。
+
+建议把错误分为两类：
+
+# 答案错误
+reward = 0.0
+valid_reward = True
+
+# Judge API 调用失败
+reward = 0.0
+valid_reward = False
+
+训练侧应过滤：
+
+valid_reward = false
+
+的 trajectory，而不是把它作为负样本更新模型。
+
+至少在 metadata 中增加：
+
+metadata = {
+    "judge_provider": "deepseek",
+    "judge_model": model,
+    "judge_valid": False,
+    "judge_error": str(exc),
+}
+八、推荐最终 reward
+
+第一版建议：
+
+final_reward = (
+    0.70 * correctness
+    + 0.20 * numeric_match
+    + 0.10 * table_bonus
+)
+
+后续再加入工具成本：
+
+tool_cost = min(turns / 20.0, 1.0)
+
+final_reward = (
+    0.70 * correctness
+    + 0.20 * numeric_match
+    + 0.10 * table_bonus
+    - 0.05 * tool_cost
+)
+
+不要一开始就加入太大的工具惩罚，否则模型可能通过“不调用工具、快速乱答”来减少成本。
+
+最佳落地顺序
+
+今天先做：
+
+OpenAI Judge 改为 DeepSeek V4 Flash/Pro。
+跑 API 独立测试。
+跑 pytest。
+跑 1 个 batch GRPO。
+检查 reward 不是全零。
+增加程序化 numeric reward。
+再跑 20 个 batch做对比。
+
+你最终的项目亮点可以表述为：
+
+设计程序化数值校验与 DeepSeek Judge 相结合的混合奖励函数，降低 LLM-as-Judge 噪声与调用成本；在多轮财务分析 Agent 上通过 GRPO 优化答案正确性、目标表访问率和工具调用效率。
